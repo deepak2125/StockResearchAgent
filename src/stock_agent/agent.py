@@ -1,45 +1,21 @@
 """
-LangGraph tool-calling agent.
+LangGraph tool-calling agent with automatic fallback.
 
-Architecture
-------------
+Primary path  — native tool-calling (models that support it: llama3.1+, mistral-nemo, etc.)
+Fallback path — prompt-based tool selection (works with any model)
 
-  User question
-       │
-       ▼
-  ┌─────────────────────────────────────────────────────┐
-  │              LangGraph ReAct Agent                  │
-  │                                                     │
-  │  ┌──────────┐     tool_call?     ┌───────────────┐  │
-  │  │  agent   │ ─────────────────► │ tool_executor │  │
-  │  │ (Ollama) │ ◄───────────────── │               │  │
-  │  └──────────┘    tool_result     └───────────────┘  │
-  │       │                                             │
-  │  no more tools                                      │
-  │       │                                             │
-  │       ▼                                             │
-  │   final answer                                      │
-  └─────────────────────────────────────────────────────┘
+The fallback asks the LLM to output a JSON decision describing which tool
+to call, executes the tool, then asks the LLM again with the real data.
 
-Tools available to the LLM
----------------------------
-  get_market_data(country_or_region)  →  market snapshot for a region
+Tools
+-----
+  get_market_data(country_or_region)  →  live market snapshot for a region/country
   get_stock_price(ticker)             →  quote + stats + financials + news
-
-The LLM (ChatOllama) reads both tool schemas and decides which to call
-based purely on the user's question.  If the user asks "How is India doing
-and what is Reliance's stock price?" the LLM will call BOTH tools.
-
-Flow per turn
--------------
-  1. LLM receives [SystemMessage, HumanMessage(question)]
-  2. If LLM issues a tool_call → tool_executor runs the tool → result appended
-  3. LLM sees the tool result and either calls another tool or writes a final answer
-  4. Tokens streamed to Gradio as they arrive
 """
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterator
 from typing import Any
 
@@ -77,6 +53,30 @@ Disclaimer: remind the user once per conversation (not every message) that your 
 is for informational purposes only and does not constitute regulated financial advice."""
 
 
+# Prompt used by the fallback path to get a structured tool-selection decision
+_TOOL_SELECTION_PROMPT = """You are a tool-routing assistant. Based on the user question below, decide which tool(s) to call.
+
+Available tools:
+  1. get_market_data(country_or_region: str)
+     Use for: questions about a country's market, a region (US, Europe, Asia), or asset class (crypto, currencies, futures).
+     Example args: "US", "India", "Europe", "crypto", "currencies"
+
+  2. get_stock_price(ticker: str)
+     Use for: questions about a specific company or stock ticker.
+     Ticker format: SYMBOL:EXCHANGE  e.g. AAPL:NASDAQ, RELIANCE:NSE, TSLA:NASDAQ, TCS:NSE, BTC-USD
+     If the user gives a company name without a ticker, infer the most likely ticker.
+
+Respond ONLY with a JSON array of tool calls. No other text. Example:
+[
+  {{"tool": "get_stock_price", "args": {{"ticker": "AAPL:NASDAQ"}}}},
+  {{"tool": "get_market_data", "args": {{"country_or_region": "US"}}}}
+]
+
+If no tool is needed (e.g. a general greeting), return an empty array: []
+
+User question: {question}"""
+
+
 # ── Tool executor ─────────────────────────────────────────────────────────────
 
 _TOOL_MAP: dict[str, Any] = {
@@ -85,12 +85,9 @@ _TOOL_MAP: dict[str, Any] = {
 }
 
 
-def _execute_tool_call(tool_call: dict) -> ToolMessage:
-    """Execute a single tool call dict and return a ToolMessage."""
-    name = tool_call["name"]
-    args = tool_call.get("args", {})
+def _execute_tool_call(name: str, args: dict, call_id: str = "0") -> ToolMessage:
+    """Execute a tool by name and return a ToolMessage."""
     tool_fn = _TOOL_MAP.get(name)
-
     if tool_fn is None:
         result = f"Unknown tool: {name}"
     else:
@@ -98,32 +95,16 @@ def _execute_tool_call(tool_call: dict) -> ToolMessage:
             result = tool_fn.invoke(args)
         except Exception as exc:
             result = f"Tool error: {exc}"
+    return ToolMessage(content=str(result), tool_call_id=call_id)
 
-    return ToolMessage(content=str(result), tool_call_id=tool_call["id"])
 
+# ── Native tool-calling path ──────────────────────────────────────────────────
 
-# ── Core agent loop ───────────────────────────────────────────────────────────
-
-def run_tool_agent(
+def _run_native_tool_agent(
     user_question: str,
-    model: str | None = None,
+    llm: Any,
 ) -> Iterator[str]:
-    """
-    Run the tool-calling ReAct loop and stream the final answer.
-
-    Flow
-    ----
-    1. Build messages: [SystemMessage, HumanMessage]
-    2. Call LLM with tools bound
-    3. If response has tool_calls → execute each → append ToolMessages → go to 2
-    4. If no tool_calls → stream the final text answer token by token
-
-    Yields
-    ------
-    str
-        Progress indicators and final LLM tokens for Gradio.
-    """
-    llm = get_llm(model)
+    """ReAct loop using llm.bind_tools() — works only on tool-capable models."""
     llm_with_tools = llm.bind_tools(ALL_TOOLS)
 
     messages: list = [
@@ -131,67 +112,149 @@ def run_tool_agent(
         HumanMessage(content=user_question),
     ]
 
-    # ── ReAct loop (max 5 iterations to prevent runaway) ─────────────────────
-    max_iterations = 5
-    for iteration in range(max_iterations):
-
-        # Non-streaming call to check for tool use first
-        response: AIMessage = llm_with_tools.invoke(messages)
+    response: AIMessage | None = None
+    for _ in range(5):  # max iterations
+        response = llm_with_tools.invoke(messages)
         messages.append(response)
 
         tool_calls = getattr(response, "tool_calls", None) or []
-
         if not tool_calls:
-            # No tools called — this is the final answer, stream it
             break
 
-        # ── Execute tool calls ────────────────────────────────────────────
         for tc in tool_calls:
             name  = tc.get("name", "?")
             args  = tc.get("args", {})
             label = list(args.values())[0] if args else ""
             yield f"🔧 Calling **{name}**({label})…\n\n"
 
-            tool_msg = _execute_tool_call(tc)
+            tool_msg = _execute_tool_call(name, args, tc.get("id", "0"))
             messages.append(tool_msg)
 
-            # Show a brief preview of the raw data
             preview = tool_msg.content[:600]
-            ellipsis = "…" if len(tool_msg.content) > 600 else ""
-            yield f"📊 **Tool result preview:**\n```\n{preview}{ellipsis}\n```\n\n"
-
+            suffix  = "…" if len(tool_msg.content) > 600 else ""
+            yield f"📊 **Tool result preview:**\n```\n{preview}{suffix}\n```\n\n"
     else:
-        # Hit max iterations without a final answer
-        yield "⚠️ Agent reached max iterations. Partial results above may still be useful."
-        return
+        yield "⚠️ Agent reached max iterations.\n\n"
 
-    # ── Stream the final answer ───────────────────────────────────────────────
     yield "---\n\n🤖 **AI Analysis:**\n\n"
 
-    # The last message is the AIMessage with the final text — stream it
-    final_text = response.content if isinstance(response.content, str) else ""
+    final_text = (response.content if response and isinstance(response.content, str) else "")
     if final_text:
-        # Simulate streaming by yielding the whole text
-        # (invoke() already completed, we just output it)
         yield final_text
     else:
-        # Fallback: stream a fresh response from the accumulated messages
         for chunk in llm.stream(messages):
             if chunk.content:
                 yield chunk.content
 
 
-# ── Convenience wrappers kept for backward compat with ui.py ─────────────────
+# ── Prompt-based fallback path ────────────────────────────────────────────────
 
-def run_agent(
+def _parse_tool_calls(raw: str) -> list[dict]:
+    """Extract the JSON array from the LLM's tool-selection response."""
+    # Strip markdown code fences if present
+    raw = re.sub(r"```(?:json)?", "", raw).strip().rstrip("`").strip()
+    # Find the first [...] block
+    match = re.search(r"\[.*?\]", raw, re.DOTALL)
+    if not match:
+        return []
+    try:
+        return json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return []
+
+
+def _run_fallback_agent(
     user_question: str,
-    trend: str = "indexes",   # kept for signature compat, ignored
+    llm: Any,
+) -> Iterator[str]:
+    """
+    Prompt-based tool selection for models that don't support bind_tools().
+
+    Step 1: Ask the LLM which tool(s) to call → get JSON
+    Step 2: Execute the tools
+    Step 3: Ask the LLM to analyse the results
+    """
+    # Step 1 — tool selection
+    selection_prompt = _TOOL_SELECTION_PROMPT.format(question=user_question)
+    selection_response = llm.invoke([HumanMessage(content=selection_prompt)])
+    raw_selection = selection_response.content if hasattr(selection_response, "content") else str(selection_response)
+
+    tool_calls = _parse_tool_calls(raw_selection)
+
+    # Step 2 — execute tools
+    tool_results: list[str] = []
+    if tool_calls:
+        for tc in tool_calls:
+            name = tc.get("tool", "")
+            args = tc.get("args", {})
+            if not name or name not in _TOOL_MAP:
+                continue
+            label = list(args.values())[0] if args else ""
+            yield f"🔧 Calling **{name}**({label})…\n\n"
+
+            tool_msg = _execute_tool_call(name, args)
+            preview = tool_msg.content[:600]
+            suffix  = "…" if len(tool_msg.content) > 600 else ""
+            yield f"📊 **Tool result preview:**\n```\n{preview}{suffix}\n```\n\n"
+            tool_results.append(f"[{name}({label})]\n{tool_msg.content}")
+    else:
+        # No tools needed — answer directly
+        yield "---\n\n🤖 **AI Analysis:**\n\n"
+        for chunk in llm.stream([
+            SystemMessage(content=SYSTEM_PROMPT),
+            HumanMessage(content=user_question),
+        ]):
+            if chunk.content:
+                yield chunk.content
+        return
+
+    # Step 3 — final analysis with tool data
+    yield "---\n\n🤖 **AI Analysis:**\n\n"
+
+    context = "\n\n".join(tool_results)
+    final_messages = [
+        SystemMessage(content=SYSTEM_PROMPT),
+        HumanMessage(content=(
+            f"Here is the live market data you retrieved:\n\n{context}\n\n"
+            f"Now answer the user's question: {user_question}"
+        )),
+    ]
+    for chunk in llm.stream(final_messages):
+        if chunk.content:
+            yield chunk.content
+
+
+# ── Public entry-point ────────────────────────────────────────────────────────
+
+def run_tool_agent(
+    user_question: str,
     model: str | None = None,
 ) -> Iterator[str]:
     """
-    Backward-compatible wrapper used by the Market Overview tab.
-    Passes the question directly to the tool-calling agent.
+    Try native tool-calling first; fall back to prompt-based selection
+    automatically if the model reports it doesn't support tools.
     """
+    llm = get_llm(model)
+
+    try:
+        yield from _run_native_tool_agent(user_question, llm)
+    except Exception as exc:
+        err = str(exc).lower()
+        # Models that don't support tool-calling return a 400 with "does not support tools"
+        if "does not support tools" in err or "tool" in err and "400" in err:
+            yield f"ℹ️ Model doesn't support native tool-calling — using prompt-based selection.\n\n"
+            yield from _run_fallback_agent(user_question, llm)
+        else:
+            yield f"❌ Error: {exc}"
+
+
+# ── Convenience wrappers (called by ui.py) ────────────────────────────────────
+
+def run_agent(
+    user_question: str,
+    trend: str = "indexes",
+    model: str | None = None,
+) -> Iterator[str]:
     yield from run_tool_agent(user_question=user_question, model=model)
 
 
@@ -200,10 +263,6 @@ def run_stock_agent(
     user_question: str,
     model: str | None = None,
 ) -> Iterator[str]:
-    """
-    Backward-compatible wrapper used by the Stock Lookup tab.
-    Enriches the question with the ticker and passes to the tool-calling agent.
-    """
     ticker = ticker.strip().upper().replace(" ", ":")
     if not ticker:
         yield "❌ Please enter a stock ticker, e.g. **AAPL:NASDAQ** or **RELIANCE:NSE**."

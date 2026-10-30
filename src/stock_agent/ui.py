@@ -191,14 +191,14 @@ def build_ui() -> gr.Blocks:
 
                 gr.Examples(
                     examples=[
-                        ["AAPL:NASDAQ",    "Is Apple a good buy right now?"],
-                        ["RELIANCE:NSE",   "Give me a full fundamental analysis."],
-                        ["TSLA:NASDAQ",    "What are the key risks for Tesla?"],
-                        ["TCS:NSE",        "How has TCS been performing financially?"],
-                        ["GOOGL:NASDAQ",   "Summarise the latest news and financials."],
-                        ["BTC-USD",        "What's the current Bitcoin sentiment?"],
+                        ["Is Apple a good buy right now?",                  "AAPL:NASDAQ"],
+                        ["Give me a full fundamental analysis.",             "RELIANCE:NSE"],
+                        ["What are the key risks for Tesla?",               "TSLA:NASDAQ"],
+                        ["How has TCS been performing financially?",        "TCS:NSE"],
+                        ["Summarise the latest news and financials.",       "GOOGL:NASDAQ"],
+                        ["What's the current Bitcoin sentiment?",           "BTC-USD"],
                     ],
-                    inputs=[ticker_box, stock_msg],
+                    inputs=[stock_msg, ticker_box],
                     label="Quick-start examples",
                 )
 
@@ -222,7 +222,8 @@ def build_ui() -> gr.Blocks:
         )
         stock_send.click(**stock_submit)
         stock_msg.submit(**stock_submit)
-        stock_clear.click(fn=lambda: ([], ""), outputs=[stock_chatbot, stock_msg])
+        ticker_box.submit(**stock_submit)
+        stock_clear.click(fn=lambda: ([], "", ""), outputs=[stock_chatbot, stock_msg, ticker_box])
 
         # Shared
         refresh_models_btn.click(
